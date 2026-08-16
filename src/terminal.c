@@ -206,6 +206,7 @@ static void update_system_term(term_T *term);
 #endif
 
 static void handle_postponed_scrollback(term_T *term);
+static void reflow_scrollback(term_T *term, int new_cols);
 
 // The character that we know (or assume) that the terminal expects for the
 // backspace key.
@@ -3627,9 +3628,12 @@ handle_resize(int rows, int cols, void *user)
 {
     term_T	*term = (term_T *)user;
     win_T	*wp;
+    int		old_cols = term->tl_cols;
 
     term->tl_rows = rows;
     term->tl_cols = cols;
+    if (cols != old_cols && term->tl_scrollback_scrolled > 0)
+	reflow_scrollback(term, cols);
     if (term->tl_vterm_size_changed)
 	// Size was set by vterm_set_size(), don't set the window size.
 	term->tl_vterm_size_changed = FALSE;
@@ -3646,6 +3650,267 @@ handle_resize(int rows, int cols, void *user)
 	redraw_buf_later(term->tl_buffer, UPD_NOT_VALID);
     }
     return 1;
+}
+
+/*
+ * Append one new tl_scrollback fragment of "cols" cells (copied from
+ * "scratch") to "new_gap".  Returns FAIL, without changing "new_gap", when
+ * out of memory.
+ */
+    static int
+reflow_flush_fragment(
+	garray_T    *new_gap,
+	cellattr_T  *scratch,
+	int	    cols,
+	long	    bytes,
+	cellattr_T  fill_attr,
+	int	    continuation)
+{
+    cellattr_T	*cells = NULL;
+    sb_line_T	*line;
+
+    if (cols > 0)
+    {
+	cells = ALLOC_MULT(cellattr_T, cols);
+	if (cells == NULL)
+	    return FAIL;
+	mch_memmove(cells, scratch, cols * sizeof(cellattr_T));
+    }
+    if (ga_grow(new_gap, 1) == FAIL)
+    {
+	vim_free(cells);
+	return FAIL;
+    }
+
+    line = (sb_line_T *)new_gap->ga_data + new_gap->ga_len++;
+    line->sb_cols = cols;
+    line->sb_bytes = (int)bytes;
+    line->sb_cells = cells;
+    line->sb_fill_attr = fill_attr;
+    line->sb_text = NULL;
+    line->continuation = (char_u)continuation;
+    return OK;
+}
+
+/*
+ * Rewrap one logical (continuation-joined) scrollback line to "new_cols"
+ * columns.  The line consists of old_lines[group_start], a non-continuation
+ * fragment, through old_lines[group_end], its last continuation fragment;
+ * their combined text is buffer line "lnum", spanning "total_bytes" bytes.
+ * The buffer line itself is never changed: new tl_scrollback fragments
+ * describing it are appended to "new_gap" instead.  A double-width
+ * character is never split across a fragment boundary.
+ * Returns FAIL, without changing "new_gap", when out of memory.
+ */
+    static int
+reflow_group(
+	term_T	    *term,
+	linenr_T    lnum,
+	sb_line_T   *old_lines,
+	int	    group_start,
+	int	    group_end,
+	long	    total_bytes,
+	int	    new_cols,
+	garray_T    *new_gap)
+{
+    char_u	*p = ml_get_buf(term->tl_buffer, lnum, FALSE);
+    // Bound the walk by whichever is shorter: the group's own recorded
+    // byte count, or the buffer line's actual length.  The former protects
+    // against reading past the fragments belonging to this group (e.g. a
+    // stale snapshot tail glued onto the same buffer line, see
+    // reflow_scrollback()); the latter is a safety net in case the
+    // recorded byte count and the buffer line ever disagree, so this never
+    // reads or writes outside the bounds of "old_lines" or "p".
+    char_u	*p_end = p + total_bytes;
+    char_u	*p_realend = p + STRLEN(p);
+    int		old_idx = group_start;
+    int		old_col = 0;
+    int		scratch_len = new_cols < 2 ? 2 : new_cols;
+    cellattr_T	*scratch = ALLOC_MULT(cellattr_T, scratch_len);
+    int		cur_cols = 0;
+    long	cur_bytes = 0;
+    int		fragments = 0;
+    int		start_len = new_gap->ga_len;
+
+    if (p_end > p_realend)
+	p_end = p_realend;
+
+    if (scratch == NULL)
+	return FAIL;
+
+    while (p < p_end)
+    {
+	int		mbl = mb_ptr2len(p);
+	cellattr_T	attr;
+	int		cw;
+
+	while (old_idx <= group_end && old_col >= old_lines[old_idx].sb_cols)
+	{
+	    old_col -= old_lines[old_idx].sb_cols;
+	    ++old_idx;
+	}
+	if (old_idx > group_end)
+	    // The fragments in this group ran out before "p_end" did; the
+	    // recorded byte count and the cell data disagree.  Stop here
+	    // rather than reading past "old_lines[group_end]".
+	    break;
+	attr = old_lines[old_idx].sb_cells[old_col];
+	cw = attr.width > 0 ? attr.width : 1;
+
+	if (cur_cols > 0 && cur_cols + cw > new_cols)
+	{
+	    if (reflow_flush_fragment(new_gap, scratch, cur_cols, cur_bytes,
+			term->tl_default_color, fragments > 0) == FAIL)
+		goto fail;
+	    ++fragments;
+	    cur_cols = 0;
+	    cur_bytes = 0;
+	}
+
+	scratch[cur_cols] = attr;
+	if (cw == 2)
+	    scratch[cur_cols + 1] = attr;
+	cur_cols += cw;
+	cur_bytes += mbl;
+	old_col += cw;
+	p += mbl;
+
+	if (cur_cols >= new_cols)
+	{
+	    if (reflow_flush_fragment(new_gap, scratch, cur_cols, cur_bytes,
+			term->tl_default_color, fragments > 0) == FAIL)
+		goto fail;
+	    ++fragments;
+	    cur_cols = 0;
+	    cur_bytes = 0;
+	}
+    }
+
+    if ((cur_cols > 0 || fragments == 0) && reflow_flush_fragment(new_gap,
+		scratch, cur_cols, cur_bytes,
+		old_lines[group_end].sb_fill_attr, fragments > 0) == FAIL)
+	goto fail;
+
+    vim_free(scratch);
+    return OK;
+
+fail:
+    while (new_gap->ga_len > start_len)
+    {
+	--new_gap->ga_len;
+	vim_free(((sb_line_T *)new_gap->ga_data)[new_gap->ga_len].sb_cells);
+    }
+    vim_free(scratch);
+    return FAIL;
+}
+
+/*
+ * Rewrap the persistent scrollback lines of "term" to fit "new_cols"
+ * columns.  Called from handle_resize() when the terminal width changes.
+ * Only lines below tl_scrollback_scrolled (real, permanent scrollback) are
+ * touched; anything above that is a transient snapshot of the live screen,
+ * which is rebuilt separately by update_snapshot().
+ * Because continuation fragments are already joined into a single,
+ * physical buffer line (see add_scrollback_line_to_buffer()), reflowing
+ * never needs to change the buffer text or the number of lines: it only
+ * rebuilds the tl_scrollback fragment boundaries used by term_get_attr()
+ * and term_scrape() to find the right attributes for a character.
+ */
+    static void
+reflow_scrollback(term_T *term, int new_cols)
+{
+    garray_T	*gap = &term->tl_scrollback;
+    sb_line_T	*old_lines = (sb_line_T *)gap->ga_data;
+    int		old_prefix_len = term->tl_scrollback_scrolled;
+    int		suffix_len = gap->ga_len - old_prefix_len;
+    garray_T	new_prefix;
+    garray_T	to_free;
+    linenr_T	lnum = 0;
+    int		i = 0;
+
+    if (old_prefix_len <= 0)
+	return;
+
+    ga_init2(&new_prefix, sizeof(sb_line_T), 100);
+    ga_init2(&to_free, sizeof(cellattr_T *), 100);
+
+    while (i < old_prefix_len)
+    {
+	int	group_start = i;
+	int	group_end = i;
+	long	total_bytes = old_lines[i].sb_bytes;
+
+	++lnum;
+	while (group_end + 1 < old_prefix_len
+			&& old_lines[group_end + 1].continuation)
+	{
+	    ++group_end;
+	    total_bytes += old_lines[group_end].sb_bytes;
+	}
+
+	if (group_end == group_start
+		&& old_lines[group_start].sb_cols <= new_cols)
+	{
+	    // Fast path: this line already fits, keep the fragment as is.
+	    if (ga_grow(&new_prefix, 1) == FAIL)
+		break;
+	    ((sb_line_T *)new_prefix.ga_data)[new_prefix.ga_len++] =
+							old_lines[group_start];
+	}
+	else if (reflow_group(term, lnum, old_lines, group_start, group_end,
+			    total_bytes, new_cols, &new_prefix) == OK)
+	{
+	    int j;
+
+	    if (ga_grow(&to_free, group_end - group_start + 1) == OK)
+		for (j = group_start; j <= group_end; ++j)
+		    ((cellattr_T **)to_free.ga_data)[to_free.ga_len++] =
+							 old_lines[j].sb_cells;
+	}
+	else
+	{
+	    // Out of memory: keep this group in its old, un-reflowed form
+	    // rather than losing it.
+	    int j;
+
+	    for (j = group_start; j <= group_end; ++j)
+	    {
+		if (ga_grow(&new_prefix, 1) == FAIL)
+		    break;
+		((sb_line_T *)new_prefix.ga_data)[new_prefix.ga_len++] =
+								  old_lines[j];
+	    }
+	}
+
+	i = group_end + 1;
+    }
+
+    if (ga_grow(gap, new_prefix.ga_len + suffix_len - gap->ga_len) == OK)
+    {
+	// Note: gap->ga_data (and thus "old_lines") may have been
+	// reallocated by ga_grow(); do not use "old_lines" below this
+	// point, "to_free" already holds the pointers that are still
+	// needed.
+	if (suffix_len > 0)
+	    mch_memmove((sb_line_T *)gap->ga_data + new_prefix.ga_len,
+		    (sb_line_T *)gap->ga_data + old_prefix_len,
+		    suffix_len * sizeof(sb_line_T));
+	mch_memmove(gap->ga_data, new_prefix.ga_data,
+		new_prefix.ga_len * sizeof(sb_line_T));
+	gap->ga_len = new_prefix.ga_len + suffix_len;
+	term->tl_scrollback_scrolled = new_prefix.ga_len;
+
+	for (i = 0; i < to_free.ga_len; ++i)
+	    vim_free(((cellattr_T **)to_free.ga_data)[i]);
+    }
+    else
+	// Could not make room: free the freshly built replacements and
+	// leave the original scrollback completely untouched.
+	for (i = 0; i < new_prefix.ga_len; ++i)
+	    vim_free(((sb_line_T *)new_prefix.ga_data)[i].sb_cells);
+
+    ga_clear(&new_prefix);
+    ga_clear(&to_free);
 }
 
 /*
@@ -5178,6 +5443,10 @@ create_vterm(term_T *term, int rows, int cols)
     vterm_screen_set_callbacks(screen, &screen_callbacks, term);
     vterm_screen_set_damage_merge(screen, VTERM_DAMAGE_SCROLL);
     vterm_screen_callbacks_has_pushline4(screen);
+    // Rewrap lines when the terminal is resized, instead of truncating or
+    // padding them.  reflow_scrollback() takes care of the lines that were
+    // already pushed to Vim's own scrollback.
+    vterm_screen_enable_reflow(screen, 1);
     // TODO: depends on 'encoding'.
     vterm_set_utf8(vterm, 1);
 

@@ -2504,4 +2504,180 @@ func Test_terminal_unwraps()
   bwipe!
 endfunc
 
+" Return non-zero if any of the currently visible rows of terminal "buf"
+" is exactly "text".  Used to wait for a sentinel line, without assuming
+" which exact row it ends up on.
+func s:TermHasLine(buf, text)
+  return index(map(range(1, term_getsize(a:buf)[0]), 'term_getline(a:buf, v:val)'), a:text) >= 0
+endfunc
+
+" Wait until the persistent part of the buffer (the part not coming from the
+" live screen) stops changing.  A sentinel line becoming visible only means
+" the job produced it; slower-than-usual systems (e.g. under a sanitizer)
+" may still be in the middle of flushing preceding output into the buffer,
+" so waiting for two identical reads in a row avoids racing with that.
+func s:WaitForBufferQuiet(buf)
+  let prev = []
+  for _ in range(50)
+    let cur = getline(1, '$')
+    if cur ==# prev
+      return
+    endif
+    let prev = cur
+    call TermWait(a:buf, 50)
+  endfor
+endfunc
+
+func Test_terminal_reflow_buffer_unchanged()
+  CheckNotMSWindows
+  CheckUnix
+
+  20vnew
+  redraw
+  let cmd = ['/bin/sh', '-c', 'i=0; while [ $i -lt 30 ]; do i=$((i + 1)); '
+	\ .. 'echo "line $i 1234567890123456789012345678901234567890"; done; '
+	\ .. 'i=0; while [ $i -lt 20 ]; do i=$((i + 1)); echo "PAD $i"; done; sleep 2']
+  let buf = term_start(cmd, {'term_rows': 4, 'term_cols': 20})
+  " Wait until enough padding lines have arrived that "line 1" .. "line 30"
+  " have definitely scrolled well into the persistent scrollback (not just
+  " the still-live screen), so they can't race with the resizes below.
+  " The padding lines themselves are still trickling in near the live
+  " screen at this point, so only the "line N" prefix is compared.
+  call WaitForAssert({-> assert_equal(1, s:TermHasLine(buf, 'PAD 20'))})
+  call s:WaitForBufferQuiet(buf)
+
+  " The first 30 lines must already have scrolled into the persistent
+  " scrollback.
+  let before = getline(1, 30)
+  call assert_equal('line 30 1234567890123456789012345678901234567890',
+	\ before[-1])
+
+  " Reflowing must never change existing buffer text or reorder lines,
+  " only change how it is internally wrapped.
+  for newcols in [60, 15, 40]
+    call term_setsize(buf, 0, newcols)
+    redraw
+    call assert_equal(before, getline(1, 30), 'after resizing to ' .. newcols)
+  endfor
+
+  call WaitForAssert({-> assert_equal('finished', term_getstatus(buf))})
+  call assert_equal(before, getline(1, 30), 'after the job finished')
+
+  bwipe!
+endfunc
+
+func Test_terminal_reflow_scrollback_fragments()
+  CheckNotMSWindows
+  CheckUnix
+
+  20vnew
+  redraw
+  let cmd = ['/bin/sh', '-c', 'printf "%s\n" ' .. repeat('a', 45) .. '; i=0; '
+	\ .. 'while [ $i -lt 12 ]; do i=$((i + 1)); echo "line$i"; done; '
+	\ .. 'echo ALLDONE; sleep 2']
+
+  " Terminal A starts narrow, where the long line wraps, and is then
+  " widened once some of it has scrolled into persistent scrollback.
+  let bufA = term_start(cmd, {'term_rows': 3, 'term_cols': 20})
+  call WaitForAssert({-> assert_equal(1, s:TermHasLine(bufA, 'ALLDONE'))})
+  call s:WaitForBufferQuiet(bufA)
+  call term_setsize(bufA, 0, 40)
+  redraw
+  call WaitForAssert({-> assert_equal('finished', term_getstatus(bufA))})
+
+  " Terminal B is the reference: started directly at the target width, so
+  " it never needed to reflow anything.
+  let bufB = term_start(cmd, {'term_rows': 3, 'term_cols': 40, 'hidden': 1})
+  call WaitForAssert({-> assert_equal('finished', term_getstatus(bufB))})
+
+  " A reflowed terminal must end up with exactly the same scrollback
+  " fragment layout (text, per-cell width and byte length) as one that was
+  " natively started at that width.
+  for r in range(-20, 3)
+    call assert_equal(term_scrape(bufB, r), term_scrape(bufA, r), 'row ' .. r)
+  endfor
+
+  exe bufA .. 'bwipe'
+  exe bufB .. 'bwipe'
+endfunc
+
+func Test_terminal_reflow_colors()
+  CheckNotMSWindows
+  CheckUnix
+
+  20vnew
+  redraw
+  let cmd = ['/bin/sh', '-c', 'printf "\033[31m%s\033[0m\n" ' .. repeat('a', 45)
+	\ .. '; printf "\033[32m%s\033[0m\n" ' .. repeat('b', 45)
+	\ .. '; i=0; while [ $i -lt 12 ]; do i=$((i + 1)); echo "line$i"; done; '
+	\ .. 'echo ALLDONE; sleep 2']
+
+  let buf = term_start(cmd, {'term_rows': 3, 'term_cols': 20})
+  call WaitForAssert({-> assert_equal(1, s:TermHasLine(buf, 'ALLDONE'))})
+  call s:WaitForBufferQuiet(buf)
+  call term_setsize(buf, 0, 40)
+  redraw
+  call WaitForAssert({-> assert_equal('finished', term_getstatus(buf))})
+
+  " After reflowing from 20 to 40 columns, each reflowed fragment must keep
+  " its own line's color: colors must not "smear" onto a neighbouring line,
+  " a regression seen in an earlier version of this feature.
+  let red_fg = ''
+  let green_fg = ''
+  for r in range(-20, 3)
+    let cells = term_scrape(buf, r)
+    if empty(cells)
+      continue
+    endif
+    let text = join(map(copy(cells), 'v:val.chars'), '')
+    let fgs = uniq(sort(map(copy(cells), 'v:val.fg')))
+    call assert_equal(1, len(fgs),
+	  \ 'row ' .. r .. ' (' .. text .. ') has mixed colors: ' .. string(fgs))
+    if text =~ '^a\+$'
+      let red_fg = fgs[0]
+    elseif text =~ '^b\+$'
+      let green_fg = fgs[0]
+    endif
+  endfor
+  call assert_notequal('', red_fg, 'never found the red line')
+  call assert_notequal('', green_fg, 'never found the green line')
+  call assert_notequal(red_fg, green_fg,
+	\ 'colors smeared between lines: both are ' .. red_fg)
+
+  bwipe!
+endfunc
+
+func Test_terminal_reflow_during_normal_mode()
+  CheckNotMSWindows
+  CheckUnix
+
+  20vnew
+  redraw
+  let buf = Run_shell_in_terminal({'term_rows': 6, 'term_cols': 20})
+  call term_sendkeys(buf, "echo hello world this is a fairly long line\<CR>")
+  call TermWait(buf)
+
+  " Enter Terminal-Normal mode and resize while in it.  Window-driven
+  " resizing is suppressed in this mode (term_do_update_window() returns
+  " FALSE), but term_setsize() can still be called directly, e.g. from a
+  " script; this must not corrupt the scrollback or crash.
+  " Note: "<C-W>N" must be fed to this Vim instance itself (it's a window
+  " command, not terminal input), unlike term_sendkeys() which sends keys
+  " to the job running in the terminal.
+  call feedkeys("\<C-W>N", "xt")
+  call TermWait(buf)
+  call term_setsize(buf, 0, 15)
+  call feedkeys("a", "xt")
+  call TermWait(buf, 300)
+
+  " The terminal must still be usable: new output should still arrive and
+  " display correctly after resizing during Terminal-Normal mode.
+  call term_sendkeys(buf, "echo after_resize\<CR>")
+  call WaitForAssert({-> assert_equal(1, s:TermHasLine(buf, 'after_resize'))})
+
+  call job_stop(term_getjob(buf), 'kill')
+  call TermWait(buf)
+  exe buf .. 'bwipe!'
+endfunc
+
 " vim: shiftwidth=2 sts=2 expandtab
