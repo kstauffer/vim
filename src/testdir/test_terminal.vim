@@ -2680,4 +2680,46 @@ func Test_terminal_reflow_during_normal_mode()
   exe buf .. 'bwipe!'
 endfunc
 
+" Regression test: wrapped lines that arrive while in Terminal-Normal mode
+" are queued in tl_scrollback_postponed and moved into tl_scrollback by
+" handle_postponed_scrollback() when normal mode is left.  That function
+" used to forget to copy the "continuation" flag, which made a later
+" resize's reflow miscount logical lines and crash with E315/E340.
+func Test_terminal_reflow_postponed_continuation()
+  CheckNotMSWindows
+  CheckUnix
+
+  20vnew
+  redraw
+  let buf = Run_shell_in_terminal({'term_rows': 6, 'term_cols': 20})
+
+  call feedkeys("\<C-W>N", "xt")
+  call TermWait(buf)
+
+  " Produce enough long (wrapping) lines while in Terminal-Normal mode that
+  " several scroll off the top and get queued in tl_scrollback_postponed.
+  call term_sendkeys(buf,
+	\ "for i in $(seq 1 30); do echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa$i; done\<CR>")
+  call TermWait(buf, 300)
+
+  " Leaving Terminal-Normal mode flushes tl_scrollback_postponed.
+  call feedkeys("a", "xt")
+  call TermWait(buf, 300)
+
+  " A resize now walks the flushed fragments; with the continuation flag
+  " lost this used to overcount logical lines and error out.
+  let v:errmsg = ''
+  call term_setsize(buf, 0, 15)
+  redraw
+  call assert_equal('', v:errmsg)
+
+  " The terminal must still be usable afterwards.
+  call term_sendkeys(buf, "echo after_resize\<CR>")
+  call WaitForAssert({-> assert_equal(1, s:TermHasLine(buf, 'after_resize'))})
+
+  call job_stop(term_getjob(buf), 'kill')
+  call TermWait(buf)
+  exe buf .. 'bwipe!'
+endfunc
+
 " vim: shiftwidth=2 sts=2 expandtab
