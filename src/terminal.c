@@ -4117,6 +4117,7 @@ handle_postponed_scrollback(term_T *term)
 	line->sb_cells = pp_line->sb_cells;
 	line->sb_fill_attr = pp_line->sb_fill_attr;
 	line->sb_text = NULL;
+	line->continuation = pp_line->continuation;
 	++term->tl_scrollback_scrolled;
 	++term->tl_scrollback.ga_len;
 	if (!pp_line->continuation)
