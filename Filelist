@@ -1229,5 +1229,6 @@ IGNORE = \
 		ci/hlgroups.ignore \
 		src/libvterm/CODE-MAP \
 		runtime/syntax/testdir/input/html_html \
+		CLAUDE.md \
 
 # vim: set ft=make:
