@@ -149,6 +149,8 @@ struct terminal_S {
 
     garray_T	tl_scrollback;
     int		tl_scrollback_scrolled;
+    int		tl_scrollback_reflow_needed;	// tl_cols changed since the
+						// last reflow_scrollback()
     garray_T	tl_scrollback_postponed;
     int		tl_scrollback_snapshot;
     int		tl_buffer_scrolled;
@@ -207,6 +209,7 @@ static void update_system_term(term_T *term);
 
 static void handle_postponed_scrollback(term_T *term);
 static void reflow_scrollback(term_T *term, int new_cols);
+static void maybe_reflow_scrollback(term_T *term);
 
 // The character that we know (or assume) that the terminal expects for the
 // backspace key.
@@ -3633,7 +3636,12 @@ handle_resize(int rows, int cols, void *user)
     term->tl_rows = rows;
     term->tl_cols = cols;
     if (cols != old_cols && term->tl_scrollback_scrolled > 0)
-	reflow_scrollback(term, cols);
+	// Don't reflow now: with a large 'termwinscroll' this can be
+	// expensive, and a resize during a window drag fires repeatedly.
+	// Defer it until term_getline() or term_scrape() actually reads
+	// scrollback history, since nothing else depends on the fragment
+	// layout matching the current width (see reflow_scrollback()).
+	term->tl_scrollback_reflow_needed = TRUE;
     if (term->tl_vterm_size_changed)
 	// Size was set by vterm_set_size(), don't set the window size.
 	term->tl_vterm_size_changed = FALSE;
@@ -3911,6 +3919,23 @@ reflow_scrollback(term_T *term, int new_cols)
 
     ga_clear(&new_prefix);
     ga_clear(&to_free);
+}
+
+/*
+ * Reflow the persistent scrollback if a resize left it pending.  Called
+ * before term_getline()/term_scrape() read scrollback history: those are
+ * the only consumers that need the fragment layout to match tl_cols (see
+ * reflow_scrollback()'s comment); a plain resize does not need to pay for
+ * this up front.
+ */
+    static void
+maybe_reflow_scrollback(term_T *term)
+{
+    if (!term->tl_scrollback_reflow_needed)
+	return;
+    term->tl_scrollback_reflow_needed = FALSE;
+    if (term->tl_scrollback_scrolled > 0)
+	reflow_scrollback(term, term->tl_cols);
 }
 
 /*
@@ -6776,8 +6801,11 @@ f_term_getline(typval_T *argvars, typval_T *rettv)
     {
 	linenr_T  lnum = 0;
 	size_t	  offset = 0;
-	int	  sb_row = term->tl_scrollback_scrolled + row;
+	int	  sb_row;
 	sb_line_T *line;
+
+	maybe_reflow_scrollback(term);
+	sb_row = term->tl_scrollback_scrolled + row;
 
 	if (sb_row < 0 || sb_row >= term->tl_scrollback.ga_len)
 	    return;
@@ -7044,9 +7072,12 @@ f_term_scrape(typval_T *argvars, typval_T *rettv)
     }
     else
     {
-	int	  sb_row = term->tl_scrollback_scrolled + pos.row;
+	int	  sb_row;
 	linenr_T  lnum = 0;
 	size_t	  offset = 0;
+
+	maybe_reflow_scrollback(term);
+	sb_row = term->tl_scrollback_scrolled + pos.row;
 
 	scrollbackline_pos_in_buf(term, sb_row, &lnum, NULL, &offset);
 
