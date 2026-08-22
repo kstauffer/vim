@@ -2601,6 +2601,42 @@ func Test_terminal_reflow_scrollback_fragments()
   exe bufB .. 'bwipe'
 endfunc
 
+" Reflow is deferred until term_getline()/term_scrape() is actually called
+" (see maybe_reflow_scrollback()), to avoid paying for it on every resize
+" with a large 'termwinscroll'.  Several resizes with no such call in
+" between must still end up reflowed to only the LAST width once queried.
+func Test_terminal_reflow_lazy()
+  CheckNotMSWindows
+  CheckUnix
+
+  20vnew
+  redraw
+  let cmd = ['/bin/sh', '-c', 'printf "%s\n" ' .. repeat('a', 45) .. '; i=0; '
+	\ .. 'while [ $i -lt 12 ]; do i=$((i + 1)); echo "line$i"; done; '
+	\ .. 'echo ALLDONE; sleep 2']
+
+  let bufA = term_start(cmd, {'term_rows': 3, 'term_cols': 20})
+  call WaitForAssert({-> assert_equal(1, s:TermHasLine(bufA, 'ALLDONE'))})
+  call s:WaitForBufferQuiet(bufA)
+  " Resize several times with no term_scrape()/term_getline() call in
+  " between; only the final width (40) should end up reflected.
+  call term_setsize(bufA, 0, 30)
+  call term_setsize(bufA, 0, 60)
+  call term_setsize(bufA, 0, 40)
+  redraw
+  call WaitForAssert({-> assert_equal('finished', term_getstatus(bufA))})
+
+  let bufB = term_start(cmd, {'term_rows': 3, 'term_cols': 40, 'hidden': 1})
+  call WaitForAssert({-> assert_equal('finished', term_getstatus(bufB))})
+
+  for r in range(-20, 3)
+    call assert_equal(term_scrape(bufB, r), term_scrape(bufA, r), 'row ' .. r)
+  endfor
+
+  exe bufA .. 'bwipe'
+  exe bufB .. 'bwipe'
+endfunc
+
 func Test_terminal_reflow_colors()
   CheckNotMSWindows
   CheckUnix
