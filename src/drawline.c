@@ -118,13 +118,18 @@ typedef struct {
 #endif
     int		vcol_off_tp;	// offset for virtual text
 #ifdef FEAT_TERMINAL
-    int		vcol_off_sbr;	// offset for filler cells drawn by
-				// 'showbreak', wrapped 'linebreak' padding,
-				// 'breakindent' and text property virtual
-				// text that do not correspond to any buffer
-				// text; used by term_get_attr() to map a
-				// screen column back to the right terminal
-				// cell
+    long	term_attr_vcol;	// running count of real characters only
+				// (never filler such as 'showbreak',
+				// wrapped 'linebreak' padding,
+				// 'breakindent' or virtual text), advanced
+				// in lockstep with "ptr"; used by
+				// term_get_attr() to map a screen column
+				// back to the right terminal cell,
+				// immune by construction to any future
+				// filler-drawing feature
+    int		term_attr_char;	// TRUE when the character drawn by the
+				// current iteration is real buffer text
+				// (i.e. came from "ptr", not filler)
 #endif
 #ifdef FEAT_SYN_HL
     int		draw_color_col;	// highlight colorcolumn
@@ -550,10 +555,6 @@ handle_breakindent(win_T *wp, winlinevars_T *wlv)
 		if (wlv->n_extra < 0)
 		    wlv->n_extra = 0;
 	    }
-#ifdef FEAT_TERMINAL
-	    // breakindent fill is not buffer text, see vcol_off_sbr.
-	    wlv->vcol_off_sbr += wlv->n_extra;
-#endif
 
 	    // Correct start of highlighted area for 'breakindent',
 	    if (wlv->fromcol >= wlv->vcol
@@ -611,10 +612,6 @@ handle_showbreak_and_filler(win_T *wp, winlinevars_T *wlv)
 	wlv->c_final = NUL;
 	wlv->n_extra = (int)STRLEN(sbr);
 	wlv->vcol_sbr = wlv->vcol + MB_CHARLEN(sbr);
-#ifdef FEAT_TERMINAL
-	// 'showbreak' text is not buffer text either, see vcol_off_sbr.
-	wlv->vcol_off_sbr += MB_CHARLEN(sbr);
-#endif
 
 	// Correct start of highlighted area for 'showbreak'.
 	if (wlv->fromcol >= wlv->vcol && wlv->fromcol < wlv->vcol_sbr)
@@ -1861,6 +1858,15 @@ win_line(
 	chartabsize_T	cts;
 	int		charsize = 0;
 	int		head = 0;
+#ifdef FEAT_TERMINAL
+	// Skipped characters are real buffer text, just not displayed;
+	// "head" is the 'showbreak'/'breakindent' filler width, if any,
+	// that win_lbr_chartabsize() folded into "charsize" for a
+	// character starting a wrapped row - keep term_attr_vcol in step
+	// with "ptr" by excluding it, same as the main loop below does.
+	long		term_col = 0;
+	int		true_charsize = 0;
+#endif
 
 	init_chartabsize_arg(&cts, wp, lnum, wlv.vcol, line, ptr);
 	cts.cts_max_head_vcol = v;
@@ -1869,6 +1875,10 @@ win_line(
 	    head = 0;
 	    charsize = win_lbr_chartabsize(&cts, &head, NULL);
 	    cts.cts_vcol += charsize;
+#ifdef FEAT_TERMINAL
+	    true_charsize = charsize - head;
+	    term_col += true_charsize;
+#endif
 	    prev_ptr = cts.cts_ptr;
 	    if (*prev_ptr == NUL)
 		break;
@@ -1898,6 +1908,9 @@ win_line(
 	wlv.vcol = cts.cts_vcol;
 	ptr = cts.cts_ptr;
 	clear_chartabsize_arg(&cts);
+#ifdef FEAT_TERMINAL
+	wlv.term_attr_vcol = term_col;
+#endif
 
 	// When:
 	// - 'cuc' is set, or
@@ -1918,6 +1931,9 @@ win_line(
 	if (wlv.vcol > v)
 	{
 	    wlv.vcol -= charsize;
+#ifdef FEAT_TERMINAL
+	    wlv.term_attr_vcol -= true_charsize;
+#endif
 	    ptr = prev_ptr;
 	}
 	if (v > wlv.vcol)
@@ -2445,13 +2461,6 @@ win_line(
 				}
 			    }
 			}
-#ifdef FEAT_TERMINAL
-			// This virtual text is not buffer text, see
-			// vcol_off_sbr; covers "before"/"after" text that
-			// skipped the block above unchanged, and "right",
-			// "above" and "below" text adjusted by it.
-			wlv.vcol_off_sbr += vim_strsize(wlv.p_extra);
-#endif
 
 			// If the text didn't reach until the first window
 			// column we need to skip cells.
@@ -2624,8 +2633,7 @@ win_line(
 		syntax_attr = 0;
 # ifdef FEAT_TERMINAL
 		if (get_term_attr)
-		    syntax_attr = term_get_attr(wp, lnum,
-						  wlv.vcol - wlv.vcol_off_sbr);
+		    syntax_attr = term_get_attr(wp, lnum, wlv.term_attr_vcol);
 # endif
 		// Get syntax attribute.
 		if (has_syntax)
@@ -2758,6 +2766,14 @@ win_line(
 	    else
 		wlv.char_attr = hl_combine_attr(wlv.win_attr, wlv.char_attr);
 	}
+
+#ifdef FEAT_TERMINAL
+	// Whatever character this iteration ends up drawing, decide now
+	// (before "ptr" or "n_extra" can change below) whether it will come
+	// from the buffer ("ptr") or from filler ("p_extra"/"c_extra"); used
+	// to keep term_attr_vcol advancing in step with "ptr" only.
+	wlv.term_attr_char = get_term_attr && wlv.n_extra == 0;
+#endif
 
 	// Get the next character to put on the screen.
 
@@ -3212,12 +3228,6 @@ win_line(
 		    // TODO: consider using "tailp" here
 		    wlv.n_extra = win_lbr_chartabsize(&cts, NULL, NULL) - 1;
 		    clear_chartabsize_arg(&cts);
-#ifdef FEAT_TERMINAL
-		    // The padding used to push a word that doesn't fit onto
-		    // the next screen line is not buffer text either, see
-		    // vcol_off_sbr.
-		    wlv.vcol_off_sbr += wlv.n_extra;
-#endif
 
 		    if (on_last_col && c != TAB)
 			// Do not continue search/match highlighting over the
@@ -3784,6 +3794,10 @@ win_line(
 
 		    if (wlv.n_extra > 0)
 			wlv.vcol_off_co += wlv.n_extra;
+#ifdef FEAT_TERMINAL
+		    if (wlv.term_attr_char)
+			wlv.term_attr_vcol += wlv.n_extra;
+#endif
 		    wlv.vcol += wlv.n_extra;
 		    if (wp->w_p_wrap && wlv.n_extra > 0)
 		    {
@@ -4235,7 +4249,13 @@ win_line(
 			&& wlv.filler_todo <= 0
 #endif
 			)
+		{
 		    ScreenCols[wlv.off] = ++wlv.vcol;
+#ifdef FEAT_TERMINAL
+		    if (wlv.term_attr_char)
+			++wlv.term_attr_vcol;
+#endif
+		}
 		else
 		    ScreenCols[wlv.off] = -1;
 
@@ -4279,6 +4299,10 @@ win_line(
 		// need to advance one more virtual column.
 		++wlv.vcol;
 		++wlv.vcol_off_co;
+#ifdef FEAT_TERMINAL
+		if (wlv.term_attr_char)
+		    ++wlv.term_attr_vcol;
+#endif
 	    }
 
 	    if (wlv.n_extra > 0)
@@ -4308,6 +4332,10 @@ win_line(
 		if (wlv.n_extra > 0)
 		{
 		    wlv.vcol += wlv.n_extra;
+#ifdef FEAT_TERMINAL
+		    if (wlv.term_attr_char)
+			wlv.term_attr_vcol += wlv.n_extra;
+#endif
 # ifdef FEAT_RIGHTLEFT
 		    if (wp->w_p_rl)
 		    {
@@ -4377,6 +4405,10 @@ win_line(
 		if (wlv.n_extra > 0)
 		{
 		    wlv.vcol += wlv.n_extra;
+#ifdef FEAT_TERMINAL
+		    if (wlv.term_attr_char)
+			wlv.term_attr_vcol += wlv.n_extra;
+#endif
 		    wlv.n_extra = 0;
 		    n_attr = 0;
 		}
@@ -4400,7 +4432,13 @@ win_line(
 		&& wlv.filler_todo <= 0
 #endif
 		)
+	{
 	    ++wlv.vcol;
+#ifdef FEAT_TERMINAL
+	    if (wlv.term_attr_char)
+		++wlv.term_attr_vcol;
+#endif
+	}
 
 #ifdef FEAT_SYN_HL
 	if (vcol_save_attr >= 0)
