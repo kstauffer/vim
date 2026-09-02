@@ -155,6 +155,21 @@ struct terminal_S {
     int		tl_scrollback_snapshot;
     int		tl_buffer_scrolled;
 
+    // Cache for bufline_pos_in_scrollback(), which is called once per
+    // screen cell drawn from a terminal buffer's scrollback.  Lookups
+    // happen in non-decreasing "lnum" order while a screen is redrawn
+    // (all columns of one line, then the next line down), so continuing
+    // from the last position avoids re-scanning tl_scrollback from the
+    // start for every single cell.  0 means "no cached position".
+    linenr_T	tl_sb_cache_lnum;
+    int		tl_sb_cache_row;
+    // tl_scrollback_scrolled as it was when the cache was filled; the
+    // only two things that rearrange tl_scrollback's committed prefix
+    // (limit_scrollback(), reflow_scrollback()) both update that field,
+    // so comparing it detects a stale cache without needing to hunt
+    // down and invalidate the cache at every such call site.
+    int		tl_sb_cache_scrolled;
+
     char_u	*tl_highlight_name; // replaces "Terminal"; allocated
 
     cellattr_T	tl_default_color;
@@ -1472,7 +1487,7 @@ bufline_pos_in_scrollback(term_T *term, linenr_T lnum, int col, int *row, int *w
 {
     buf_T	*buf = term->tl_buffer;
     sb_line_T	*lines = (sb_line_T *)term->tl_scrollback.ga_data;
-    linenr_T    calc_row = term->tl_scrollback_scrolled;
+    linenr_T    calc_row;
     int         calc_col = col;
     linenr_T    l;
 
@@ -1487,6 +1502,15 @@ bufline_pos_in_scrollback(term_T *term, linenr_T lnum, int col, int *row, int *w
 	while (calc_row < term->tl_scrollback.ga_len && lines[calc_row].continuation)
 	    ++calc_row;
     }
+    else if (term->tl_sb_cache_lnum > 0
+	    && term->tl_sb_cache_lnum <= lnum
+	    && term->tl_sb_cache_scrolled == term->tl_scrollback_scrolled)
+    {
+	// Continue from the last lookup instead of rescanning from the
+	// start of tl_scrollback; see the comment on tl_sb_cache_lnum.
+	calc_row = term->tl_sb_cache_row;
+	l = term->tl_sb_cache_lnum;
+    }
     else
     {
 	calc_row = 0;
@@ -1498,6 +1522,13 @@ bufline_pos_in_scrollback(term_T *term, linenr_T lnum, int col, int *row, int *w
 	++calc_row;
 	if (!lines[calc_row].continuation)
 	    ++l;
+    }
+
+    if (lnum <= term->tl_buffer_scrolled)
+    {
+	term->tl_sb_cache_lnum = lnum;
+	term->tl_sb_cache_row = calc_row;
+	term->tl_sb_cache_scrolled = term->tl_scrollback_scrolled;
     }
 
     while (calc_row + 1 < term->tl_scrollback.ga_len && lines[calc_row + 1].continuation
