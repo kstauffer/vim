@@ -156,11 +156,15 @@ struct terminal_S {
     int		tl_buffer_scrolled;
 
     // Cache for bufline_pos_in_scrollback(), which is called once per
-    // screen cell drawn from a terminal buffer's scrollback.  Lookups
-    // happen in non-decreasing "lnum" order while a screen is redrawn
-    // (all columns of one line, then the next line down), so continuing
-    // from the last position avoids re-scanning tl_scrollback from the
-    // start for every single cell.  0 means "no cached position".
+    // screen cell drawn from a terminal buffer's scrollback.  Within one
+    // redraw, lookups are in non-decreasing "lnum" order (all columns of
+    // one line, then the next line down); across redraws the next one
+    // may start anywhere - forward (e.g. the next page down), a bit
+    // behind where the previous one ended (e.g. the next page down
+    // scrolled less than a full screen), or well behind it (scrolling
+    // up).  Continuing from the last position, walking forward or
+    // backward as needed, avoids re-scanning tl_scrollback from the
+    // start in any of those cases.  0 means "no cached position".
     linenr_T	tl_sb_cache_lnum;
     int		tl_sb_cache_row;
     // tl_scrollback_scrolled as it was when the cache was filled; the
@@ -1503,13 +1507,31 @@ bufline_pos_in_scrollback(term_T *term, linenr_T lnum, int col, int *row, int *w
 	    ++calc_row;
     }
     else if (term->tl_sb_cache_lnum > 0
-	    && term->tl_sb_cache_lnum <= lnum
-	    && term->tl_sb_cache_scrolled == term->tl_scrollback_scrolled)
+	    && term->tl_sb_cache_scrolled == term->tl_scrollback_scrolled
+	    && term->tl_sb_cache_lnum <= lnum)
     {
-	// Continue from the last lookup instead of rescanning from the
-	// start of tl_scrollback; see the comment on tl_sb_cache_lnum.
+	// Continue forward from the last lookup instead of rescanning
+	// from the start of tl_scrollback; see the comment on
+	// tl_sb_cache_lnum.
 	calc_row = term->tl_sb_cache_row;
 	l = term->tl_sb_cache_lnum;
+    }
+    else if (term->tl_sb_cache_lnum > 0
+	    && term->tl_sb_cache_scrolled == term->tl_scrollback_scrolled)
+    {
+	// The target is behind the last lookup (e.g. scrolling back up,
+	// or landing before the bottom of what the previous redraw
+	// reached): walk backward from there instead of forward from
+	// the start, so that costs the same as continuing forward does.
+	calc_row = term->tl_sb_cache_row;
+	l = term->tl_sb_cache_lnum;
+	while (calc_row > 0 && l > lnum)
+	{
+	    --calc_row;
+	    while (calc_row > 0 && lines[calc_row].continuation)
+		--calc_row;
+	    --l;
+	}
     }
     else
     {
