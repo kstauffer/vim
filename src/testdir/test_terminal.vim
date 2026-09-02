@@ -2683,6 +2683,130 @@ func Test_terminal_reflow_colors()
   bwipe!
 endfunc
 
+" The next three tests are a matched set: 'showbreak', 'linebreak' and
+" 'breakindent' each draw filler cells at a wrapped continuation row that
+" have no corresponding character in the buffer.  win_line() counted that
+" filler into the same running column it hands to term_get_attr() to look
+" up a :terminal buffer's stored color, so the column drifted away from the
+" real cumulative offset into the line and term_get_attr() picked the
+" wrong stored color for however many characters the filler width covers.
+" This only shows up once a terminal buffer is a plain, finished line
+" re-wrapped by vim's own 'wrap' (not vterm's); until the job's channel
+" actually closes the window is still blitted straight from the live
+" vterm screen, which knows nothing about these options, so each test
+" waits out that "finished" -> plain buffer transition before checking.
+
+func Test_terminal_wrap_showbreak_colors()
+  CheckNotMSWindows
+  CheckUnix
+  CheckFeature linebreak
+
+  let save_showbreak = &showbreak
+  set showbreak=+++
+  20vnew
+  redraw
+  " Three colors packed together with no separators, wide enough that
+  " vterm itself never wraps it; only the "ccc" run ends up entirely on
+  " the wrapped row, right after the showbreak text.
+  let cmd = ['/bin/sh', '-c', 'printf "\033[31m%s\033[32m%s\033[34m%s\033[0m\n" '
+	\ .. repeat('a', 10) .. ' ' .. repeat('b', 10) .. ' ' .. repeat('c', 10)]
+  let buf = term_start(cmd, {'term_rows': 6, 'term_cols': 40})
+  call WaitForAssert({-> assert_equal('finished', term_getstatus(buf))})
+  for _ in range(20)
+    sleep 20m
+    redraw
+  endfor
+  vertical resize 20
+  redraw
+
+  let attrs = []
+  for col in range(4, 13)
+    call add(attrs, screenattr(2, col))
+  endfor
+  call assert_equal(1, len(uniq(copy(attrs))),
+	\ "'c' colors on the wrapped row do not match: " .. string(attrs))
+
+  let &showbreak = save_showbreak
+  bwipe!
+endfunc
+
+func Test_terminal_wrap_linebreak_colors()
+  CheckNotMSWindows
+  CheckUnix
+  CheckFeature linebreak
+
+  20vnew
+  redraw
+  " A space separates the two colored words so 'linebreak' has somewhere to
+  " break; the window is narrowed just enough that the second word would be
+  " split mid-word without 'linebreak' forcing it onto its own screen line.
+  let cmd = ['/bin/sh', '-c', 'printf "\033[31m%s \033[32m%s\033[0m\n" '
+	\ .. repeat('a', 10) .. ' ' .. repeat('b', 10)]
+  let buf = term_start(cmd, {'term_rows': 6, 'term_cols': 40})
+  call WaitForAssert({-> assert_equal('finished', term_getstatus(buf))})
+  for _ in range(20)
+    sleep 20m
+    redraw
+  endfor
+  set wrap linebreak
+  vertical resize 15
+  redraw
+
+  let attrs = []
+  for col in range(1, 10)
+    call add(attrs, screenattr(2, col))
+  endfor
+  call assert_equal(1, len(uniq(copy(attrs))),
+	\ "'b' colors on the linebreak-wrapped row do not match: " .. string(attrs))
+
+  set wrap& linebreak&
+  bwipe!
+endfunc
+
+func Test_terminal_wrap_breakindent_colors()
+  CheckNotMSWindows
+  CheckUnix
+  CheckFeature linebreak
+
+  20vnew
+  redraw
+  " 8 leading spaces, which 'breakindent' repeats at the start of the
+  " wrapped row; a red run long enough to still be crossing the wrap point
+  " after breakindent eats into the row width, followed by a green run so
+  " a color boundary lands on the wrapped row too.
+  let cmd = ['/bin/sh', '-c', 'printf "        \033[31m%s\033[32m%s\033[0m\n" '
+	\ .. repeat('a', 15) .. ' ' .. repeat('b', 15)]
+  let buf = term_start(cmd, {'term_rows': 6, 'term_cols': 40})
+  call WaitForAssert({-> assert_equal('finished', term_getstatus(buf))})
+  for _ in range(20)
+    sleep 20m
+    redraw
+  endfor
+  set wrap breakindent breakindentopt=min:0
+  vertical resize 20
+  redraw
+
+  " Row 2 is "        aaabbbbbbbbb": 8-column breakindent fill, then 3 more
+  " red 'a's, then 9 green 'b's.
+  let a_attrs = []
+  for col in [9, 10, 11]
+    call add(a_attrs, screenattr(2, col))
+  endfor
+  let b_attrs = []
+  for col in range(12, 20)
+    call add(b_attrs, screenattr(2, col))
+  endfor
+  call assert_equal(1, len(uniq(copy(a_attrs))),
+	\ "'a' colors after the breakindent fill do not match: " .. string(a_attrs))
+  call assert_equal(1, len(uniq(copy(b_attrs))),
+	\ "'b' colors after the breakindent fill do not match: " .. string(b_attrs))
+  call assert_notequal(a_attrs[0], b_attrs[0],
+	\ "'a' and 'b' got the same color, the boundary was not detected")
+
+  set wrap& breakindent& breakindentopt&
+  bwipe!
+endfunc
+
 func Test_terminal_reflow_during_normal_mode()
   CheckNotMSWindows
   CheckUnix

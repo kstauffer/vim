@@ -117,6 +117,14 @@ typedef struct {
     int		vcol_off_co;	// offset for concealed characters
 #endif
     int		vcol_off_tp;	// offset for virtual text
+#ifdef FEAT_TERMINAL
+    int		vcol_off_sbr;	// offset for filler cells drawn by
+				// 'showbreak', wrapped 'linebreak' padding
+				// and 'breakindent' that do not correspond
+				// to any buffer text; used by
+				// term_get_attr() to map a screen column
+				// back to the right terminal cell
+#endif
 #ifdef FEAT_SYN_HL
     int		draw_color_col;	// highlight colorcolumn
     int		*color_cols;	// pointer to according columns array
@@ -541,6 +549,10 @@ handle_breakindent(win_T *wp, winlinevars_T *wlv)
 		if (wlv->n_extra < 0)
 		    wlv->n_extra = 0;
 	    }
+#ifdef FEAT_TERMINAL
+	    // breakindent fill is not buffer text, see vcol_off_sbr.
+	    wlv->vcol_off_sbr += wlv->n_extra;
+#endif
 
 	    // Correct start of highlighted area for 'breakindent',
 	    if (wlv->fromcol >= wlv->vcol
@@ -598,6 +610,10 @@ handle_showbreak_and_filler(win_T *wp, winlinevars_T *wlv)
 	wlv->c_final = NUL;
 	wlv->n_extra = (int)STRLEN(sbr);
 	wlv->vcol_sbr = wlv->vcol + MB_CHARLEN(sbr);
+#ifdef FEAT_TERMINAL
+	// 'showbreak' text is not buffer text either, see vcol_off_sbr.
+	wlv->vcol_off_sbr += MB_CHARLEN(sbr);
+#endif
 
 	// Correct start of highlighted area for 'showbreak'.
 	if (wlv->fromcol >= wlv->vcol && wlv->fromcol < wlv->vcol_sbr)
@@ -2600,7 +2616,8 @@ win_line(
 		syntax_attr = 0;
 # ifdef FEAT_TERMINAL
 		if (get_term_attr)
-		    syntax_attr = term_get_attr(wp, lnum, wlv.vcol);
+		    syntax_attr = term_get_attr(wp, lnum,
+						  wlv.vcol - wlv.vcol_off_sbr);
 # endif
 		// Get syntax attribute.
 		if (has_syntax)
@@ -3187,6 +3204,12 @@ win_line(
 		    // TODO: consider using "tailp" here
 		    wlv.n_extra = win_lbr_chartabsize(&cts, NULL, NULL) - 1;
 		    clear_chartabsize_arg(&cts);
+#ifdef FEAT_TERMINAL
+		    // The padding used to push a word that doesn't fit onto
+		    // the next screen line is not buffer text either, see
+		    // vcol_off_sbr.
+		    wlv.vcol_off_sbr += wlv.n_extra;
+#endif
 
 		    if (on_last_col && c != TAB)
 			// Do not continue search/match highlighting over the
