@@ -143,6 +143,9 @@ typedef struct {
     long	vcol_sbr;	    // virtual column after showbreak
     int		need_showbreak;	    // overlong line, skipping first x chars
     int		dont_use_showbreak; // do not use 'showbreak'
+    int		vcol_off_wrap;	    // offset for 'showbreak'/'breakindent'
+				    // filler drawn at the start of a wrapped
+				    // line; not real buffer/terminal content
 #endif
 #ifdef FEAT_PROP_POPUP
     int		text_prop_above_count;
@@ -541,6 +544,7 @@ handle_breakindent(win_T *wp, winlinevars_T *wlv)
 		if (wlv->n_extra < 0)
 		    wlv->n_extra = 0;
 	    }
+	    wlv->vcol_off_wrap += wlv->n_extra;
 
 	    // Correct start of highlighted area for 'breakindent',
 	    if (wlv->fromcol >= wlv->vcol
@@ -598,6 +602,7 @@ handle_showbreak_and_filler(win_T *wp, winlinevars_T *wlv)
 	wlv->c_final = NUL;
 	wlv->n_extra = (int)STRLEN(sbr);
 	wlv->vcol_sbr = wlv->vcol + MB_CHARLEN(sbr);
+	wlv->vcol_off_wrap += MB_CHARLEN(sbr);
 
 	// Correct start of highlighted area for 'showbreak'.
 	if (wlv->fromcol >= wlv->vcol && wlv->fromcol < wlv->vcol_sbr)
@@ -2600,7 +2605,11 @@ win_line(
 		syntax_attr = 0;
 # ifdef FEAT_TERMINAL
 		if (get_term_attr)
-		    syntax_attr = term_get_attr(wp, lnum, wlv.vcol);
+		    syntax_attr = term_get_attr(wp, lnum, wlv.vcol
+#  ifdef FEAT_LINEBREAK
+					- wlv.vcol_off_wrap
+#  endif
+					);
 # endif
 		// Get syntax attribute.
 		if (has_syntax)

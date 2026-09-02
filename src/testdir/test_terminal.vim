@@ -2683,6 +2683,57 @@ func Test_terminal_reflow_colors()
   bwipe!
 endfunc
 
+" Regression test for https://github.com/vim/vim/issues/8691: 'showbreak'
+" (and 'breakindent') draw synthetic filler cells at the start of a wrapped
+" continuation row.  win_line() counted those cells into the same running
+" column it passes to term_get_attr(), so the column drifted further from
+" the real cumulative offset into the line with every wrap, and
+" term_get_attr() picked the wrong stored color once a finished terminal
+" buffer's line got re-wrapped by vim's own 'wrap' (not vterm's).
+func Test_terminal_showbreak_colors()
+  CheckNotMSWindows
+  CheckUnix
+  CheckFeature linebreak
+
+  let save_showbreak = &showbreak
+  set showbreak=+++
+  20vnew
+  redraw
+  " One long, three-coloured line in a terminal wide enough that vterm
+  " itself never wraps it; it only gets wrapped once it is a plain,
+  " finished buffer line displayed in the narrower window below.
+  let cmd = ['/bin/sh', '-c', 'printf "\033[31m%s\033[32m%s\033[34m%s\033[0m\n" '
+	\ .. repeat('a', 10) .. ' ' .. repeat('b', 10) .. ' ' .. repeat('c', 10)]
+  let buf = term_start(cmd, {'term_rows': 6, 'term_cols': 40})
+  call WaitForAssert({-> assert_equal('finished', term_getstatus(buf))})
+  " 'finished' job status can precede the channel actually closing; until
+  " that happens the window is still blitted straight from the live vterm
+  " (which knows nothing about 'wrap'/'showbreak'), not via win_line(), so
+  " give that a moment to settle before relying on normal buffer display.
+  for _ in range(20)
+    sleep 20m
+    redraw
+  endfor
+  " Force the window narrower than the (now plain) 30-char buffer line, so
+  " 'wrap' splits it across two screen rows.
+  vertical resize 20
+  redraw
+
+  " All ten 'c' characters land on the wrapped row, after the "+++"
+  " showbreak text.  They must all keep the same color: before the fix the
+  " showbreak width leaked into term_get_attr()'s column, so the last few
+  " incorrectly picked up the empty-fill color instead of blue.
+  let attrs = []
+  for col in range(4, 13)
+    call add(attrs, screenattr(2, col))
+  endfor
+  call assert_equal(1, len(uniq(copy(attrs))),
+	\ "'c' colors on the wrapped row do not match: " .. string(attrs))
+
+  let &showbreak = save_showbreak
+  bwipe!
+endfunc
+
 func Test_terminal_reflow_during_normal_mode()
   CheckNotMSWindows
   CheckUnix
