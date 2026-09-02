@@ -2683,18 +2683,20 @@ func Test_terminal_reflow_colors()
   bwipe!
 endfunc
 
-" The next three tests are a matched set: 'showbreak', 'linebreak' and
-" 'breakindent' each draw filler cells at a wrapped continuation row that
+" The next four tests are a matched set: 'showbreak', 'linebreak',
+" 'breakindent' and text property virtual text each draw filler cells that
 " have no corresponding character in the buffer.  win_line() counted that
 " filler into the same running column it hands to term_get_attr() to look
 " up a :terminal buffer's stored color, so the column drifted away from the
 " real cumulative offset into the line and term_get_attr() picked the
 " wrong stored color for however many characters the filler width covers.
-" This only shows up once a terminal buffer is a plain, finished line
-" re-wrapped by vim's own 'wrap' (not vterm's); until the job's channel
-" actually closes the window is still blitted straight from the live
-" vterm screen, which knows nothing about these options, so each test
-" waits out that "finished" -> plain buffer transition before checking.
+" The first three only show up once a terminal buffer is a plain, finished
+" line re-wrapped by vim's own 'wrap' (not vterm's); until the job's
+" channel actually closes the window is still blitted straight from the
+" live vterm screen, which knows nothing about these options, so each of
+" those waits out that "finished" -> plain buffer transition before
+" checking.  Virtual text can drift the column even on an unwrapped line,
+" since it is inserted before any wrap decision is made.
 
 func Test_terminal_wrap_showbreak_colors()
   CheckNotMSWindows
@@ -2804,6 +2806,60 @@ func Test_terminal_wrap_breakindent_colors()
 	\ "'a' and 'b' got the same color, the boundary was not detected")
 
   set wrap& breakindent& breakindentopt&
+  bwipe!
+endfunc
+
+func Test_terminal_wrap_proptext_colors()
+  CheckNotMSWindows
+  CheckUnix
+  CheckFeature textprop
+
+  20vnew
+  redraw
+  let cmd = ['/bin/sh', '-c', 'printf "\033[31m%s\033[32m%s\033[0m\n" '
+	\ .. repeat('a', 10) .. ' ' .. repeat('b', 10)]
+  let buf = term_start(cmd, {'term_rows': 6, 'term_cols': 40})
+  call WaitForAssert({-> assert_equal('finished', term_getstatus(buf))})
+  for _ in range(20)
+    sleep 20m
+    redraw
+  endfor
+
+  " Prepend virtual text before the line's first column; this pushes
+  " everything after it over by its width, same as 'showbreak' does at a
+  " wrapped continuation row - except here the shift happens right at the
+  " start of the (only) row, before any wrap has even occurred, and then
+  " carries into the wrap that follows.
+  call prop_type_add('WrapTest', {})
+  call prop_add(1, 1, {'type': 'WrapTest', 'text': 'XXXXX'})
+  vertical resize 20
+  redraw
+
+  " Row 1 is "XXXXXaaaaaaaaaabbbbb", row 2 is "bbbbb".
+  let a_attrs = []
+  for col in range(6, 15)
+    call add(a_attrs, screenattr(1, col))
+  endfor
+  let b_attrs = []
+  for col in range(16, 20)
+    call add(b_attrs, screenattr(1, col))
+  endfor
+  let b2_attrs = []
+  for col in range(1, 5)
+    call add(b2_attrs, screenattr(2, col))
+  endfor
+  call assert_equal(1, len(uniq(copy(a_attrs))),
+	\ "'a' colors after the virtual text do not match: " .. string(a_attrs))
+  call assert_equal(1, len(uniq(copy(b_attrs))),
+	\ "'b' colors on row 1 do not match: " .. string(b_attrs))
+  call assert_equal(1, len(uniq(copy(b2_attrs))),
+	\ "'b' colors on the wrapped row do not match: " .. string(b2_attrs))
+  call assert_notequal(a_attrs[0], b_attrs[0],
+	\ "'a' and 'b' got the same color, the boundary was not detected")
+  call assert_equal(b_attrs[0], b2_attrs[0],
+	\ "'b' color changed across the wrap")
+
+  call prop_type_delete('WrapTest')
   bwipe!
 endfunc
 

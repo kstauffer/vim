@@ -119,11 +119,12 @@ typedef struct {
     int		vcol_off_tp;	// offset for virtual text
 #ifdef FEAT_TERMINAL
     int		vcol_off_sbr;	// offset for filler cells drawn by
-				// 'showbreak', wrapped 'linebreak' padding
-				// and 'breakindent' that do not correspond
-				// to any buffer text; used by
-				// term_get_attr() to map a screen column
-				// back to the right terminal cell
+				// 'showbreak', wrapped 'linebreak' padding,
+				// 'breakindent' and text property virtual
+				// text that do not correspond to any buffer
+				// text; used by term_get_attr() to map a
+				// screen column back to the right terminal
+				// cell
 #endif
 #ifdef FEAT_SYN_HL
     int		draw_color_col;	// highlight colorcolumn
@@ -2444,6 +2445,13 @@ win_line(
 				}
 			    }
 			}
+#ifdef FEAT_TERMINAL
+			// This virtual text is not buffer text, see
+			// vcol_off_sbr; covers "before"/"after" text that
+			// skipped the block above unchanged, and "right",
+			// "above" and "below" text adjusted by it.
+			wlv.vcol_off_sbr += vim_strsize(wlv.p_extra);
+#endif
 
 			// If the text didn't reach until the first window
 			// column we need to skip cells.
