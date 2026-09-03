@@ -2683,6 +2683,71 @@ func Test_terminal_reflow_colors()
   bwipe!
 endfunc
 
+" Regression test for bufline_pos_in_scrollback(): once a scrollback line's
+" colors have been trimmed out of the live window (large 'termwinscroll'),
+" mapping a buffer line back to its stored colors must still land on the
+" right line - jumping forward, jumping back, and after a resize forces
+" reflow_scrollback() to rearrange the fragments the lookup depends on.
+func Test_terminal_scrollback_lookup()
+  CheckNotMSWindows
+  CheckUnix
+
+  20vnew
+  redraw
+  let &l:termwinscroll = 3000
+  " Every line is its own line number in red, so getline()/screenattr()
+  " together tell us both "did this land on the right line" and "does it
+  " still have its color".
+  let cmd = ['/bin/sh', '-c',
+	\ 'i=1; while [ $i -le 4000 ]; do printf "\033[31mLINE%06d\033[0m\n" $i; '
+	\ .. 'i=$((i + 1)); done']
+  let buf = term_start(cmd, {'term_rows': 6, 'term_cols': 40})
+  call WaitForAssert({-> assert_equal('finished', term_getstatus(buf))})
+  " 'finished' can precede the channel actually closing; until it does the
+  " window is still blitted from the live vterm, not through the lookup
+  " this test is for.  Give that a moment to settle.
+  for _ in range(20)
+    sleep 20m
+    redraw
+  endfor
+
+  " 'termwinscroll' trims from the front, so buffer line 1 is whichever
+  " original "LINE%06d" number survived, not necessarily 1; read it back
+  " to know what every later buffer line ought to contain.
+  let first_n = str2nr(getline(1)[4:])
+  call assert_true(first_n > 0, 'could not parse first surviving line: '
+	\ .. getline(1))
+  let last = line('$')
+
+  " Forward, then back, then forward again: exercises the index jump in
+  " both directions, plus the "same line again" fast path (repeated
+  " calls for the same target, one per screen column).
+  for target in [last / 2, last, last / 4, last - 5, 1, last / 3]
+    call cursor(target, 1)
+    redraw!
+    call assert_equal(printf('LINE%06d', first_n + target - 1),
+	  \ getline(target), 'wrong text at line ' .. target)
+    call assert_notequal(screenattr(1, 1), screenattr(1, 20),
+	  \ 'line ' .. target .. ' lost its color: ' .. getline(target))
+  endfor
+
+  " Resize while finished: reflow_scrollback() rearranges tl_scrollback,
+  " which must invalidate the index and the memo rather than leave them
+  " pointing at whatever used to be at those positions.
+  call term_setsize(buf, 0, 25)
+  redraw!
+  for target in [last - 1, last / 5, 2]
+    call cursor(target, 1)
+    redraw!
+    call assert_equal(printf('LINE%06d', first_n + target - 1),
+	  \ getline(target), 'wrong text at line ' .. target)
+    call assert_notequal(screenattr(1, 1), screenattr(1, 20),
+	  \ 'line ' .. target .. ' lost its color: ' .. getline(target))
+  endfor
+
+  bwipe!
+endfunc
+
 " The next four tests are a matched set: 'showbreak', 'linebreak',
 " 'breakindent' and text property virtual text each draw filler cells that
 " have no corresponding character in the buffer.  win_line() counted that
