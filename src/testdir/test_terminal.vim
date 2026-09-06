@@ -2748,6 +2748,65 @@ func Test_terminal_scrollback_lookup()
   bwipe!
 endfunc
 
+" Regression test for a second, independent bug in
+" bufline_pos_in_scrollback()'s sparse index: a checkpoint (recorded
+" every SB_INDEX_STRIDE rows) can land in the middle of a wrapped
+" (multi-fragment) line instead of at its start.  When a query's target
+" line number happens to equal that checkpoint's own recorded line
+" number, the walk-forward loop that would normally correct this never
+" runs (its "l < lnum" condition is already false), so the fragment at
+" the checkpoint's raw row gets used as-is - the tail of the wrapped
+" line, not its start.
+func Test_terminal_scrollback_lookup_wrap_boundary()
+  CheckNotMSWindows
+  CheckUnix
+
+  60vnew
+  redraw
+  " Line 1 (red) and line 2 (blue) are always correctly resolved
+  " (buffer line 1 is always tl_scrollback row 0, by construction), so
+  " they are trustworthy references for what "red" and "blue" look
+  " like as attr numbers in this session - unlike reading a reference
+  " off the very line under test, which would just repeat whatever
+  " (possibly wrong) attr that line already has.
+  "
+  " Then 94 short (1-fragment) lines, then one long line wrapping into
+  " exactly 5 fragments at term_cols=60 (240 "M"s + "ENDMARKER"): its
+  " fragments land at rows 96-100, so the checkpoint tl_sb_index
+  " records every 100 rows lands on row 100 - this line's own
+  " continuation tail, not its start at row 96.  The wrapped line is
+  " red for its first 240 characters and blue only for "ENDMARKER", so
+  " a lookup landing on the wrong (tail) fragment is directly visible
+  " as blue instead of red at the line's first column.
+  let cmd = ['/bin/sh', '-c',
+	\ 'printf "\033[31mREFRED\033[0m\n"; printf "\033[34mREFBLUE\033[0m\n"; '
+	\ .. 'i=0; while [ $i -lt 94 ]; do i=$((i+1)); echo "SHORT$i"; done; '
+	\ .. 'printf "\033[31m%s\033[34mENDMARKER\033[0m\n" "'
+	\ .. repeat('M', 240) .. '"; '
+	\ .. 'j=0; while [ $j -lt 30 ]; do j=$((j+1)); echo "AFTER$j"; done']
+  let buf = term_start(cmd, {'term_rows': 6, 'term_cols': 60})
+  call WaitForAssert({-> assert_equal('finished', term_getstatus(buf))})
+  " 'finished' can precede the channel actually closing; until it does
+  " the window is still blitted from the live vterm, not through the
+  " lookup this test is for.  Give that a moment to settle.
+  for _ in range(20)
+    sleep 20m
+    redraw
+  endfor
+
+  call feedkeys("1gg", "xt")
+  redraw!
+  let red_ref = screenattr(1, 1)
+
+  call feedkeys("97gg", "xt")
+  redraw!
+  call assert_equal(repeat('M', 240) .. 'ENDMARKER', getline(97))
+  call assert_equal(red_ref, screenattr(1, 1),
+	\ 'wrapped line''s own start should be red, not its "ENDMARKER" tail')
+
+  bwipe!
+endfunc
+
 " The next four tests are a matched set: 'showbreak', 'linebreak',
 " 'breakindent' and text property virtual text each draw filler cells that
 " have no corresponding character in the buffer.  win_line() counted that

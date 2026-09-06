@@ -68,14 +68,6 @@ typedef struct sb_line_S {
     char_u	continuation;
 } sb_line_T;
 
-// One entry of the sparse tl_sb_index: "at tl_scrollback[si_row] (the
-// start of a fragment, not necessarily a continuation one), the buffer
-// line number is si_lnum".  See build_sb_index().
-typedef struct {
-    linenr_T	si_lnum;
-    int		si_row;
-} sb_index_T;
-
 #ifdef MSWIN
 # ifndef HPCON
 #  define HPCON VOID*
@@ -169,16 +161,32 @@ struct terminal_S {
     // instead of walking from the start.  See build_sb_index() and the
     // comment on bufline_pos_in_scrollback() for how it and
     // tl_sb_last_lnum are kept in step with tl_scrollback.
-    garray_T	tl_sb_index;
-    int		tl_sb_index_scrolled;	// tl_scrollback_scrolled when the
-					// index was last built; a mismatch
-					// means it is stale.
+    //
+    // tl_sb_generation is bumped every time that prefix is rearranged
+    // (reflow_scrollback(), limit_scrollback()) or grown (handle_pushline(),
+    // handle_postponed_scrollback()) - the only places that ever touch it.
+    // It is compared, never set to a value derived from scrollback size:
+    // tl_scrollback_scrolled can revisit an earlier value after a trim
+    // is later regrown (or a reflow changes the fragments-per-line
+    // ratio), which would make a plain "did the count change" check
+    // wrongly conclude nothing happened; a counter that only ever goes
+    // up cannot repeat by coincidence.
+    garray_T	tl_sb_index;		// sparse array of linenr_T: entry i
+					// is the buffer line at
+					// tl_scrollback[i * SB_INDEX_STRIDE]
+    int		tl_sb_generation;
+    int		tl_sb_index_generation;	// tl_sb_generation when the index
+					// was last built; a mismatch means
+					// it is stale.
     linenr_T	tl_sb_last_lnum;	// last line bufline_pos_in_scrollback()
 					// was asked for (0: none yet), so
 					// repeated lookups for the same line
 					// (one per screen column) don't need
 					// the index at all.
     int		tl_sb_last_row;
+    int		tl_sb_last_generation;	// tl_sb_generation when tl_sb_last_row
+					// was recorded; a mismatch means it
+					// is stale.
 
     char_u	*tl_highlight_name; // replaces "Terminal"; allocated
 
@@ -1209,8 +1217,10 @@ free_scrollback(term_T *term)
 	vim_free(((sb_line_T *)term->tl_scrollback.ga_data + i)->sb_cells);
     ga_clear(&term->tl_scrollback);
     ga_clear(&term->tl_sb_index);
-    term->tl_sb_index_scrolled = 0;
+    term->tl_sb_generation = 0;
+    term->tl_sb_index_generation = 0;
     term->tl_sb_last_lnum = 0;
+    term->tl_sb_last_generation = 0;
     for (i = 0; i < term->tl_scrollback_postponed.ga_len; ++i)
 	vim_free(((sb_line_T *)term->tl_scrollback_postponed.ga_data + i)->sb_cells);
     ga_clear(&term->tl_scrollback_postponed);
@@ -1505,18 +1515,22 @@ scrollbackline_pos_in_buf(term_T *term, int row, linenr_T *lnum, int *start_col,
  * tl_scrollback (the part covered by tl_buffer_scrolled /
  * tl_scrollback_scrolled) without walking from the start.
  *
+ * Entry i records the buffer line number at tl_scrollback[i *
+ * SB_INDEX_STRIDE]; the row itself is never stored, since it is always
+ * exactly i * SB_INDEX_STRIDE by construction (this loop lays entries
+ * down in order, with no gaps, even if it stops early below).
+ *
  * Called lazily, the first time bufline_pos_in_scrollback() needs the
- * index and finds it missing or stale.  It is invalidated - by nothing
- * more than a value comparison, no call needed at the sites that change
- * things - whenever limit_scrollback() or reflow_scrollback() rearrange
- * that prefix, since both of them already maintain
- * tl_scrollback_scrolled as part of doing so.  It is also invalidated by
- * ordinary new lines being committed (the same field changes then too),
- * but that happens continuously while a job is still producing output,
- * and lookups never happen during that time (only once a buffer is
- * finished or in Terminal-Normal mode), so the wasted invalidations cost
- * nothing: the next rebuild happens lazily, on the first lookup that
- * actually follows.
+ * index and finds it missing or stale.  Staleness is tracked with
+ * tl_sb_generation, a counter bumped whenever limit_scrollback() or
+ * reflow_scrollback() rearrange the committed prefix (or handle_pushline()/
+ * handle_postponed_scrollback() grow it) - see the comment on
+ * tl_sb_generation in the term_T declaration for why a counter is used
+ * instead of comparing tl_scrollback_scrolled directly.  The wasted
+ * invalidations from ordinary growth cost nothing: lookups never happen
+ * while a job is still producing output (only once a buffer is finished
+ * or in Terminal-Normal mode), so the next rebuild happens lazily, on
+ * the first lookup that actually follows.
  */
     static void
 build_sb_index(term_T *term)
@@ -1526,7 +1540,7 @@ build_sb_index(term_T *term)
     int		row;
 
     ga_clear(&term->tl_sb_index);
-    ga_init2(&term->tl_sb_index, sizeof(sb_index_T), 100);
+    ga_init2(&term->tl_sb_index, sizeof(linenr_T), 100);
 
     for (row = 0; row < term->tl_scrollback_scrolled; ++row)
     {
@@ -1534,31 +1548,27 @@ build_sb_index(term_T *term)
 	    ++l;
 	if (row % SB_INDEX_STRIDE == 0)
 	{
-	    sb_index_T *entry;
-
 	    if (ga_grow(&term->tl_sb_index, 1) == FAIL)
 		break;
-	    entry = (sb_index_T *)term->tl_sb_index.ga_data
-						   + term->tl_sb_index.ga_len++;
-	    entry->si_lnum = l;
-	    entry->si_row = row;
+	    ((linenr_T *)term->tl_sb_index.ga_data)[term->tl_sb_index.ga_len++] = l;
 	}
     }
 
-    term->tl_sb_index_scrolled = term->tl_scrollback_scrolled;
+    term->tl_sb_index_generation = term->tl_sb_generation;
     // The memo below may now point into a differently-arranged prefix.
     term->tl_sb_last_lnum = 0;
 }
 
 /*
- * Return the tl_sb_index entry with the largest si_lnum <= "lnum".
- * Always succeeds: build_sb_index() always records row 0 (si_lnum 1) as
- * the first entry, which is "<= lnum" for any valid line number.
+ * Return the tl_sb_index of the entry with the largest recorded line
+ * number <= "lnum"; multiply by SB_INDEX_STRIDE for its tl_scrollback
+ * row.  Always succeeds: build_sb_index() always records row 0 (line 1)
+ * as the first entry, which is "<= lnum" for any valid line number.
  */
-    static sb_index_T *
+    static int
 find_sb_index_entry(term_T *term, linenr_T lnum)
 {
-    sb_index_T	*entries = (sb_index_T *)term->tl_sb_index.ga_data;
+    linenr_T	*entries = (linenr_T *)term->tl_sb_index.ga_data;
     int		lo = 0;
     int		hi = term->tl_sb_index.ga_len - 1;
 
@@ -1566,12 +1576,12 @@ find_sb_index_entry(term_T *term, linenr_T lnum)
     {
 	int mid = (lo + hi + 1) / 2;
 
-	if (entries[mid].si_lnum <= lnum)
+	if (entries[mid] <= lnum)
 	    lo = mid;
 	else
 	    hi = mid - 1;
     }
-    return &entries[lo];
+    return lo;
 }
 
 /*
@@ -1606,22 +1616,34 @@ bufline_pos_in_scrollback(term_T *term, linenr_T lnum, int col, int *row, int *w
 	while (calc_row < term->tl_scrollback.ga_len && lines[calc_row].continuation)
 	    ++calc_row;
     }
-    else if (lnum == term->tl_sb_last_lnum)
+    else if (lnum == term->tl_sb_last_lnum
+	    && term->tl_sb_last_generation == term->tl_sb_generation)
     {
 	calc_row = term->tl_sb_last_row;
 	l = lnum;
     }
     else
     {
-	sb_index_T *entry;
+	int idx;
 
 	if (term->tl_sb_index.ga_len == 0
-		|| term->tl_sb_index_scrolled != term->tl_scrollback_scrolled)
+		|| term->tl_sb_index_generation != term->tl_sb_generation)
 	    build_sb_index(term);
 
-	entry = find_sb_index_entry(term, lnum);
-	calc_row = entry->si_row;
-	l = entry->si_lnum;
+	idx = find_sb_index_entry(term, lnum);
+	calc_row = idx * SB_INDEX_STRIDE;
+	l = ((linenr_T *)term->tl_sb_index.ga_data)[idx];
+
+	// The checkpoint can land in the middle of a wrapped line (its row
+	// is a continuation fragment), in which case it already records
+	// that line's number correctly, but calc_row is not that line's
+	// start - the walk below only ever moves calc_row forward and
+	// stops as soon as l == lnum, so if the checkpoint's own l already
+	// equals lnum, the walk never runs and a mid-group calc_row would
+	// be returned as-is.  Back up to the group's actual start row (l
+	// does not change while doing so, by definition of "continuation").
+	while (calc_row > 0 && lines[calc_row].continuation)
+	    --calc_row;
     }
 
     while (calc_row < term->tl_scrollback.ga_len && l < lnum)
@@ -1635,6 +1657,7 @@ bufline_pos_in_scrollback(term_T *term, linenr_T lnum, int col, int *row, int *w
     {
 	term->tl_sb_last_lnum = lnum;
 	term->tl_sb_last_row = calc_row;
+	term->tl_sb_last_generation = term->tl_sb_generation;
     }
 
     while (calc_row + 1 < term->tl_scrollback.ga_len && lines[calc_row + 1].continuation
@@ -4044,6 +4067,7 @@ reflow_scrollback(term_T *term, int new_cols)
 		new_prefix.ga_len * sizeof(sb_line_T));
 	gap->ga_len = new_prefix.ga_len + suffix_len;
 	term->tl_scrollback_scrolled = new_prefix.ga_len;
+	++term->tl_sb_generation;
 
 	for (i = 0; i < to_free.ga_len; ++i)
 	    vim_free(((cellattr_T **)to_free.ga_data)[i]);
@@ -4117,6 +4141,7 @@ limit_scrollback(term_T *term, garray_T *gap, int update_buffer)
 	win_T *wp = NULL;
 
 	term->tl_scrollback_scrolled -= todo;
+	++term->tl_sb_generation;
 
 	FOR_ALL_WINDOWS(wp)
 	{
@@ -4226,6 +4251,7 @@ handle_pushline(int cols, const VTermScreenCell *cells, int continuation, void *
     {
 	line->sb_text = NULL;
 	++term->tl_scrollback_scrolled;
+	++term->tl_sb_generation;
 	if (!continuation)
 	    ++term->tl_buffer_scrolled;
 	ga_clear(&ga);  // free the text
@@ -4281,6 +4307,7 @@ handle_postponed_scrollback(term_T *term)
 	line->sb_text = NULL;
 	line->continuation = pp_line->continuation;
 	++term->tl_scrollback_scrolled;
+	++term->tl_sb_generation;
 	++term->tl_scrollback.ga_len;
 	if (!pp_line->continuation)
 	    ++term->tl_buffer_scrolled;
