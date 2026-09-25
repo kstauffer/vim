@@ -1169,6 +1169,16 @@ term_should_restore(buf_T *buf)
 #endif
 
 /*
+ * Free what a scrollback line refers to.
+ */
+    static void
+free_scrollback_line(sb_line_T *line)
+{
+    VIM_CLEAR(line->sb_cells);
+    VIM_CLEAR(line->sb_text);
+}
+
+/*
  * Free the scrollback buffer for "term".
  */
     static void
@@ -1177,10 +1187,11 @@ free_scrollback(term_T *term)
     int i;
 
     for (i = 0; i < term->tl_scrollback.ga_len; ++i)
-	vim_free(((sb_line_T *)term->tl_scrollback.ga_data + i)->sb_cells);
+	free_scrollback_line((sb_line_T *)term->tl_scrollback.ga_data + i);
     ga_clear(&term->tl_scrollback);
     for (i = 0; i < term->tl_scrollback_postponed.ga_len; ++i)
-	vim_free(((sb_line_T *)term->tl_scrollback_postponed.ga_data + i)->sb_cells);
+	free_scrollback_line(
+		  (sb_line_T *)term->tl_scrollback_postponed.ga_data + i);
     ga_clear(&term->tl_scrollback_postponed);
 }
 
@@ -2135,6 +2146,7 @@ add_empty_scrollback(term_T *term, cellattr_T *fill_attr, int lnum)
     line->sb_bytes = 0;
     line->sb_cells = NULL;
     line->sb_fill_attr = *fill_attr;
+    line->sb_text = NULL;
     ++term->tl_scrollback.ga_len;
     return OK;
 }
@@ -2289,6 +2301,7 @@ update_snapshot(term_T *term)
 		line->sb_bytes = ga.ga_len;
 		line->sb_cells = p;
 		line->sb_fill_attr = new_fill_attr;
+		line->sb_text = NULL;
 		line->continuation = (char_u)lineinfo->continuation;
 		fill_attr = new_fill_attr;
 		++term->tl_scrollback.ga_len;
@@ -3673,11 +3686,11 @@ limit_scrollback(term_T *term, garray_T *gap, int update_buffer)
 	    ml_delete(1);
 	    --term->tl_buffer_scrolled;
 	}
-	vim_free(sb_lines[i].sb_cells);
+	free_scrollback_line(sb_lines + i);
     }
     // Continue until end of wrapped line
     for (; todo < gap->ga_len && sb_lines[todo].continuation; ++todo)
-	vim_free(sb_lines[todo].sb_cells);
+	free_scrollback_line(sb_lines + todo);
     curbuf = curwin->w_buffer;
 
     gap->ga_len -= todo;
@@ -3843,13 +3856,14 @@ handle_postponed_scrollback(term_T *term)
 	if (text == NULL)
 	    text = (char_u *)"";
 	add_scrollback_line_to_buffer(term, text, (int)STRLEN(text), pp_line->continuation);
-	vim_free(pp_line->sb_text);
+	VIM_CLEAR(pp_line->sb_text);
 
 	line = (sb_line_T *)term->tl_scrollback.ga_data
 						 + term->tl_scrollback.ga_len;
 	line->sb_cols = pp_line->sb_cols;
 	line->sb_bytes = pp_line->sb_bytes;
 	line->sb_cells = pp_line->sb_cells;
+	pp_line->sb_cells = NULL;
 	line->sb_fill_attr = pp_line->sb_fill_attr;
 	line->sb_text = NULL;
 	++term->tl_scrollback_scrolled;
@@ -3858,6 +3872,9 @@ handle_postponed_scrollback(term_T *term)
 	    ++term->tl_buffer_scrolled;
     }
 
+    for (i = 0; i < term->tl_scrollback_postponed.ga_len; ++i)
+	free_scrollback_line(
+		  (sb_line_T *)term->tl_scrollback_postponed.ga_data + i);
     ga_clear(&term->tl_scrollback_postponed);
     limit_scrollback(term, &term->tl_scrollback, TRUE);
 }
@@ -5682,6 +5699,7 @@ read_dump_file(FILE *fd, VTermPos *cursor_pos)
 		line->sb_bytes = ga_text.ga_len;
 		line->sb_cells = ga_cell.ga_data;
 		line->sb_fill_attr = term->tl_default_color;
+		line->sb_text = NULL;
 		line->continuation = 0;
 		++term->tl_scrollback.ga_len;
 		ga_init(&ga_cell);
