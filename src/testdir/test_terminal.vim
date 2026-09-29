@@ -509,6 +509,164 @@ func Test_terminal_scroll()
   exe buf . 'bwipe'
 endfunc
 
+" The identity documented at :h term_getscrolled() -
+"     term_getline(buf, N) == getline(N + term_getscrolled(buf))
+" - must hold for wrapped lines too.  Test_terminal_scroll() above asserts the
+" same identity but only ever feeds it unwrapped input.
+func Test_terminal_scroll_wrapped()
+  CheckUnix
+
+  " As Test_terminal_scroll(), except line 50 is long enough to occupy three
+  " terminal rows at term_cols=50.
+  let lines = map(range(1, 200), 'string(v:val)')
+  let lines[49] = repeat('W', 150)
+  call writefile(lines, 'Xtext', 'D')
+  let buf = term_start("cat Xtext", {'term_rows': 10, 'term_cols': 50})
+
+  let job = term_getjob(buf)
+  call WaitForAssert({-> assert_equal("dead", job_status(job))})
+  call TermWait(buf)
+
+  " wait until the scrolling stops
+  while 1
+    let scrolled = buf->term_getscrolled()
+    sleep 20m
+    if scrolled == buf->term_getscrolled()
+      break
+    endif
+  endwhile
+
+  call assert_equal('1', getline(1))
+  call assert_equal('1', term_getline(buf, 1 - scrolled))
+  call assert_equal('49', getline(49))
+  call assert_equal('49', term_getline(buf, 49 - scrolled))
+  call assert_equal(repeat('W', 150), getline(50))
+  call assert_equal(repeat('W', 150), term_getline(buf, 50 - scrolled))
+  call assert_equal('51', getline(51))
+  call assert_equal('51', term_getline(buf, 51 - scrolled))
+  call assert_equal('200', getline(200))
+  call assert_equal('200', term_getline(buf, 200 - scrolled))
+
+  exe buf . 'bwipe'
+endfunc
+
+" A line wrapped over many terminal rows is one buffer line, and the rows are
+" joined in order.  Most other tests wrap once, which hides accumulation bugs.
+func Test_terminal_wrap_many_rows()
+  CheckUnix
+
+  " 12 rows worth of text on a 5 row screen, so the head scrolls off while the
+  " tail is still on screen.
+  let long = join(map(range(12), 'repeat(nr2char(char2nr("a") + v:val), 20)'), '')
+  call writefile([long, 'TAIL'], 'Xwrap', 'D')
+  let buf = term_start("cat Xwrap", {'term_rows': 5, 'term_cols': 20})
+  call WaitForAssert({-> assert_equal('finished', term_getstatus(buf))})
+  call WaitForAssert({-> assert_equal(long, getbufline(buf, 1)[0])})
+
+  call assert_equal([long, 'TAIL'], getbufline(buf, 1, 2))
+  call assert_equal(long, term_getline(buf, 1 - term_getscrolled(buf)))
+
+  exe buf . 'bwipe!'
+endfunc
+
+" A double-width character that does not fit in the last column is pushed to
+" the next row, leaving that row one cell short.  The joined line must not gain
+" or lose a character at that boundary.
+func Test_terminal_wrap_double_width()
+  CheckUnix
+
+  " 3 + 4*2 = 11 cells on a 10 column terminal: the fourth "chuu" cannot start
+  " in column 10, so row 1 ends after 9 cells.
+  let long = 'abc' .. repeat("中", 4)
+  call writefile([long, 'TAIL'], 'Xdw', 'D')
+  let buf = term_start("cat Xdw", {'term_rows': 6, 'term_cols': 10})
+  call WaitForAssert({-> assert_equal('finished', term_getstatus(buf))})
+  call WaitForAssert({-> assert_equal(long, getbufline(buf, 1)[0])})
+
+  call assert_equal([long, 'TAIL'], getbufline(buf, 1, 2))
+
+  exe buf . 'bwipe!'
+endfunc
+
+" 'termwinscroll' counts buffer lines, so trimming never cuts a wrapped line in
+" half.  A single line longer than 'termwinscroll' rows used to leave the buffer
+" empty.
+func Test_terminal_scrollback_wrapped()
+  CheckUnix
+
+  set termwinscroll=10
+  " 20 wrapped rows, one buffer line.
+  let long = repeat('W', 400)
+  call writefile([long], 'Xtwsl', 'D')
+  let buf = term_start("cat Xtwsl", {'term_rows': 4, 'term_cols': 20})
+  call WaitForAssert({-> assert_equal('finished', term_getstatus(buf))})
+  call WaitForAssert({-> assert_equal(long, getbufline(buf, 1)[0])})
+
+  call assert_equal(long, getbufline(buf, 1)[0])
+  exe buf . 'bwipe!'
+
+  " Trimming removes whole lines, so no line is left in pieces.
+  let wrapped = repeat('W', 44)
+  call writefile(map(range(1, 30), {_, v -> 'L' .. v .. wrapped}), 'Xtwsl2', 'D')
+  let buf = term_start("cat Xtwsl2", {'term_rows': 4, 'term_cols': 20})
+  call WaitForAssert({-> assert_equal('finished', term_getstatus(buf))})
+  call WaitForAssert({-> assert_true(len(getbufline(buf, 1, '$')) <= 11)})
+
+  call assert_equal([], filter(getbufline(buf, 1, '$'),
+	\ {_, v -> v =~# '^W\+$'}))
+
+  set termwinscroll&
+  exe buf . 'bwipe!'
+endfunc
+
+" As Test_terminal_does_not_truncate_last_newlines(), but the first line wraps.
+func Test_terminal_wrapped_last_newlines()
+  CheckUnix
+
+  let contents = [repeat('W', 45)] + repeat([''], 10)
+  call writefile(contents, 'Xwnl', 'D')
+  let buf = term_start("cat Xwnl", {'term_rows': 8, 'term_cols': 20})
+  call WaitForAssert({-> assert_equal('finished', term_getstatus(buf))})
+  call WaitForAssert({-> assert_equal(contents, getbufline(buf, 1, '$'))})
+
+  exe buf . 'bwipe!'
+endfunc
+
+" Lines that arrive while in Terminal-Normal mode are queued in
+" tl_scrollback_postponed and moved into tl_scrollback when Terminal-Job mode
+" is resumed.  A wrapped line must survive that as one buffer line, including
+" when it started before the queue and ended inside it.
+func Test_terminal_postponed_wrapped()
+  CheckUnix
+
+  let long = repeat('W', 44)
+  let pat = '^L\d\+' .. long .. '$'
+  let buf = Run_shell_in_terminal({'term_rows': 6, 'term_cols': 20})
+
+  call feedkeys("\<C-W>N", "xt")
+  call TermWait(buf, 100)
+
+  " Each line takes three terminal rows, so most of them scroll off while the
+  " buffer must not be touched.
+  call term_sendkeys(buf, 'for i in 1 2 3 4 5 6 7 8; do echo "L${i}'
+	\ .. long .. '"; done' .. "\<CR>")
+  call TermWait(buf, 300)
+
+  " Leaving Terminal-Normal mode moves the postponed lines to the scrollback.
+  call feedkeys("a", "xt")
+  call TermWait(buf, 300)
+
+  " The lines that scrolled off must each be one buffer line; a line left in
+  " pieces shows up as a bare run of W's with no "L<n>" prefix.
+  call WaitForAssert({-> assert_true(len(filter(getbufline(buf, 1, '$'),
+	\ {_, v -> v =~# pat})) >= 5)})
+  call assert_equal([], filter(getbufline(buf, 1, '$'),
+	\ {_, v -> v =~# '^W\+$'}))
+
+  call StopShellInTerminal(buf)
+  exe buf . 'bwipe!'
+endfunc
+
 func Test_terminal_scrollback()
   let buf = Run_shell_in_terminal({'term_rows': 15})
   set termwinscroll=100
@@ -2504,30 +2662,28 @@ func Test_terminal_disable_kitty_keyboard()
   bwipe!
 endfunc
 
+" A long wrapped line is two rows in libvterm and one buffer line in vim.
+" term_getline() addresses rows while the job runs, because that is the only
+" thing there is to address; once the contents have been moved to the buffer it
+" addresses buffer lines, like getline().  The job is kept alive for the first
+" half so that the two are not raced against each other.
 func Test_terminal_unwraps()
-  CheckNotMSWindows
+  CheckUnix
 
-  30vnew
-
-  redraw
-  let buf = term_start("echo 1+2+3+4+5+6+7+8+9+10+11+12+13+14+15")
-  " Wait until both wrapped lines have appeared in the terminal
+  let text = '1+2+3+4+5+6+7+8+9+10+11+12+13+14+15'
+  let buf = term_start(['/bin/sh', '-c', 'echo ' .. text .. '; sleep 30'],
+	\ {'term_rows': 6, 'term_cols': 30})
+  " Wait until both wrapped rows have appeared in the terminal.
   call WaitForAssert({-> assert_equal('14+15', term_getline(buf, 2))})
+  call assert_equal('1+2+3+4+5+6+7+8+9+10+11+12+13+', term_getline(buf, 1))
 
-  " A long wrapped line appears as 2 lines in libvterm
-  let l = term_getline(buf, 1)
-  call assert_equal('1+2+3+4+5+6+7+8+9+10+11+12+13+', l)
+  call job_stop(term_getjob(buf))
+  call WaitForAssert({-> assert_equal('finished', term_getstatus(buf))})
+  call WaitForAssert({-> assert_equal(text, getbufline(buf, 1)[0])})
 
-  let l = term_getline(buf, 2)
-  call assert_equal('14+15', l)
+  call assert_equal(text, term_getline(buf, 1 - term_getscrolled(buf)))
 
-  call TermWait(buf)
-  " It should appear as a single buffer line in vim, once the job finished and
-  " the contents were moved to the buffer.
-  call WaitForAssert({-> assert_equal(
-	\ '1+2+3+4+5+6+7+8+9+10+11+12+13+14+15', getline('$'))})
-
-  bwipe!
+  exe buf . 'bwipe!'
 endfunc
 
 " The next four tests are a matched set: 'showbreak', 'linebreak',

@@ -1,4 +1,4 @@
-*terminal.txt*	For Vim version 9.2.  Last change: 2026 Aug 30
+*terminal.txt*	For Vim version 9.2.  Last change: 2026 Sep 25
 
 
 		  VIM REFERENCE MANUAL	  by Bram Moolenaar
@@ -695,6 +695,12 @@ term_getline({buf}, {row})				*term_getline()*
 		line is used.  When {row} is invalid an empty string is
 		returned.
 
+		While the job is running {row} is a row of the terminal
+		screen, so a line that wraps is more than one {row}.  Once the
+		job has finished and the contents have been moved to the
+		buffer, {row} is a buffer line and a wrapped line is one
+		{row}, the same as for |getline()|.
+
 		To get attributes of each character use |term_scrape()|.
 
 		Can also be used as a |method|: >
@@ -795,6 +801,11 @@ term_scrape({buf}, {row})				*term_scrape()*
 		The first line has {row} one.  When {row} is "." the cursor
 		line is used.  When {row} is invalid an empty string is
 		returned.
+
+		{row} is counted as for |term_getline()|: a screen row while
+		the job runs, a buffer line afterwards.  For a wrapped line
+		the List can therefore be longer than the width of the
+		terminal once the job has finished.
 
 		Return a List containing a Dict for each screen cell:
 		    "chars"	character(s) at the cell
